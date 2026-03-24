@@ -25,17 +25,20 @@ AGENT_HOST = "h3c.sh.intel.com"
 AGENT_USER = "kaokao"
 AGENT_PASSWORD = "123"          # 建议改为 SSH 密钥认证
 
+AGENT_WORKDIR = "/wenjiao/openclaw-triton-gen/examples/auto_run"
+
 # open-claw 完整启动命令（在远端 docker 容器内执行）
 def build_agent_cmd(model: str, task: str) -> str:
     return f"""
-docker exec xpu-openclaw bash -c '
-source /opt/openclaw-venv/bin/activate && \
-export https_proxy=http://child-igk.intel.com:912 && \
-export http_proxy=http://child-igk.intel.com:912 && \
-export HF_HOME=/storage/lkk/cache && \
-export AUTO_RUN_DEVICE=xpu && \
-export AUTO_RUN_LOCAL=1 && \
-export MINIMAX_API_KEY="sk-cp-xxx" && \
+docker exec xpu-openclaw bash -c ' 
+cd {AGENT_WORKDIR} && 
+source /opt/openclaw-venv/bin/activate && 
+export https_proxy=http://child-igk.intel.com:912 && 
+export http_proxy=http://child-igk.intel.com:912 && 
+export HF_HOME=/storage/lkk/cache && 
+export AUTO_RUN_DEVICE=xpu && 
+export AUTO_RUN_LOCAL=1 && 
+export MINIMAX_API_KEY=\"sk-cp-xxx\" && 
 python batch_inference_test.py \
     --models {model} \
     --device xpu \
@@ -81,7 +84,7 @@ async def run_agent(task_id: str, model: str, prompt: str, task: str):
             AGENT_HOST,
             username=AGENT_USER,
             password=AGENT_PASSWORD,
-            known_hosts=None,          # 跳过 host key 检查（生产环境建议去掉）
+            known_hosts=None,
         ) as conn:
             await queue.put(f"[SSH] Connected. Starting task: {task} | model: {model}")
 
