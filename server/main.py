@@ -23,28 +23,11 @@ task_queues: dict[str, asyncio.Queue] = {}
 # ── Agent 服务器 SSH 配置 ──────────────────────────────────────
 AGENT_HOST = "h3c.sh.intel.com"
 AGENT_USER = "kaokao"
-AGENT_PASSWORD = "123"          # 建议改为 SSH 密钥认证
+AGENT_PASSWORD = "123"
 
 AGENT_WORKDIR = "/wenjiao/openclaw-triton-gen/examples/auto_run"
-
-# open-claw 完整启动命令（在远端 docker 容器内执行）
-def build_agent_cmd(model: str, task: str) -> str:
-    return f"""
-docker exec xpu-openclaw bash -c ' 
-cd {AGENT_WORKDIR} && 
-source /opt/openclaw-venv/bin/activate && 
-export https_proxy=http://child-igk.intel.com:912 && 
-export http_proxy=http://child-igk.intel.com:912 && 
-export HF_HOME=/storage/lkk/cache && 
-export AUTO_RUN_DEVICE=xpu && 
-export AUTO_RUN_LOCAL=1 && 
-export MINIMAX_API_KEY=\"sk-cp-xxx\" && 
-python batch_inference_test.py \
-    --models {model} \
-    --device xpu \
-    --device-index 0 \
-    --output-root /storage/lkk/inference
-'"""
+OUTPUT_ROOT = "/storage/lkk/inference"
+DOCKER_CONTAINER = "xpu-openclaw"
 
 MODELS = [
     "Qwen/Qwen3-0.6B",
@@ -54,26 +37,58 @@ MODELS = [
     "microsoft/phi-2",
 ]
 
+def model_to_dir(model: str) -> str:
+    """Qwen/Qwen3-0.6B -> Qwen_Qwen3-0.6B"""
+    return model.replace("/", "_")
+
+def build_run_cmd(model: str) -> str:
+    """后台启动 batch_inference_test.py，nohup 让它在 SSH 断开后继续跑"""
+    return (
+        f"docker exec -d {DOCKER_CONTAINER} bash -c '"
+        f"cd {AGENT_WORKDIR} && "
+        f"source /opt/openclaw-venv/bin/activate && "
+        f"export https_proxy=http://child-igk.intel.com:912 && "
+        f"export http_proxy=http://child-igk.intel.com:912 && "
+        f"export HF_HOME=/storage/lkk/cache && "
+        f"export AUTO_RUN_DEVICE=xpu && "
+        f"export AUTO_RUN_LOCAL=1 && "
+        f"export MINIMAX_API_KEY=\"sk-cp-xxx\" && "
+        f"python batch_inference_test.py"
+        f" --models {model}"
+        f" --device xpu"
+        f" --device-index 0"
+        f" --output-root {OUTPUT_ROOT}"
+        f"'"
+    )
+
+def build_tail_cmd(model: str) -> str:
+    """等 session.jsonl 出现后实时 tail"""
+    session_file = f"{OUTPUT_ROOT}/{model_to_dir(model)}/session.jsonl"
+    return (
+        f"docker exec {DOCKER_CONTAINER} bash -c '"
+        f"until [ -f {session_file} ]; do sleep 1; done && "
+        f"tail -f {session_file}"
+        f"'"
+    )
 
 class RunRequest(BaseModel):
     model: str
     prompt: str = ""
     task: str = "auto-test"
 
-
 @app.get("/api/models")
 async def get_models():
     return {"models": MODELS}
-
 
 @app.post("/api/run")
 async def run_task(req: RunRequest):
     task_id = str(uuid.uuid4())
     task_queues[task_id] = asyncio.Queue()
     t = asyncio.create_task(run_agent(task_id, req.model, req.prompt, req.task))
-    t.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+    t.add_done_callback(
+        lambda t: t.exception() if not t.cancelled() and t.exception() else None
+    )
     return {"task_id": task_id}
-
 
 async def run_agent(task_id: str, model: str, prompt: str, task: str):
     queue = task_queues[task_id]
@@ -86,19 +101,20 @@ async def run_agent(task_id: str, model: str, prompt: str, task: str):
             password=AGENT_PASSWORD,
             known_hosts=None,
         ) as conn:
-            await queue.put(f"[SSH] Connected. Starting task: {task} | model: {model}")
+            await queue.put(f"[SSH] Connected. Launching agent for model: {model}")
 
-            cmd = build_agent_cmd(model, task)
+            # ① 后台启动 batch_inference_test.py（-d 模式，立即返回）
+            run_cmd = build_run_cmd(model)
+            await conn.run(run_cmd)
+            await queue.put(f"[Agent] Task launched in background. Waiting for session.jsonl ...")
 
-            async with conn.create_process(cmd) as proc:
-                # 实时读取 stdout
+            # ② tail -f session.jsonl，实时推送新增行
+            tail_cmd = build_tail_cmd(model)
+            async with conn.create_process(tail_cmd) as proc:
                 async for line in proc.stdout:
                     await queue.put(line.rstrip())
-                # 同时捕获 stderr
                 async for line in proc.stderr:
                     await queue.put(f"[stderr] {line.rstrip()}")
-
-        await queue.put("[SSH] Task finished.")
 
     except asyncssh.Error as e:
         logger.exception("SSH error for task %s", task_id)
@@ -108,7 +124,6 @@ async def run_agent(task_id: str, model: str, prompt: str, task: str):
         await queue.put(f"[ERROR] {e}")
     finally:
         await queue.put(None)
-
 
 @app.get("/api/stream/{task_id}")
 async def stream(task_id: str):
