@@ -24,7 +24,11 @@ npm run dev
 
 Visit **http://localhost:5173**
 
-Select a model, enter a prompt, click **Auto-Test / Auto-Quant / Auto-Eval** to see real-time streaming output.
+Select a model and task, enter a prompt, click **Run Demo** to see real-time streaming output.
+
+Available tasks:
+- `auto-test`, `auto-quant`, `auto-eval` for LLM agent flow
+- `text-to-image` for image generation demo (`Tongyi-MAI/Z-Image-Turbo` recommended)
 
 ## Architecture
 
@@ -32,8 +36,9 @@ Select a model, enter a prompt, click **Auto-Test / Auto-Quant / Auto-Eval** to 
 Browser (SvelteKit :5173)
   │
   ├─ POST /api/run ──────────► FastAPI (:8000)
+  ├─ GET  /api/tasks ────────► task list for UI
   │                                │
-  │                                └─ subprocess: mock_agent.py
+  │                                └─ SSH + docker exec real agent command
   │
   └─ GET  /api/stream/{id} ◄── SSE line-by-line stdout stream
 ```
