@@ -9,7 +9,7 @@ A minimal full-stack demo: **SvelteKit** frontend + **FastAPI** backend with rea
 ```bash
 cd server
 pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8002
 ```
 
 ### 2. Start the frontend
@@ -35,7 +35,7 @@ Available tasks:
 ```
 Browser (SvelteKit :5173)
   │
-  ├─ POST /api/run ──────────► FastAPI (:8000)
+  ├─ POST /api/run ──────────► FastAPI (:8002)
   ├─ GET  /api/tasks ────────► task list for UI
   │                                │
   │                                └─ SSH + docker exec real agent command
