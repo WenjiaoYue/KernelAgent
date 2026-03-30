@@ -89,9 +89,9 @@
   let mcUser = 'kaokao';
   let mcPassword = '';
 
-  let mcContainer = 'xpu-openclaw';
-  let mcRepoRoot = '/wenjiao/openclaw-triton-gen';
-  let mcWorkdir = '/wenjiao/openclaw-triton-gen/examples/auto_run';
+  let mcContainer = 'test_clawd';
+  let mcRepoRoot = '/kaokao/openclaw-triton-gen';
+  let mcWorkdir = '/kaokao/openclaw-triton-gen/examples/auto_run';
   let mcOutputRoot = '/storage/lkk/inference';
   let mcSessionDir = '/root/.openclaw/agents/main/sessions';
   let mcMinimaxKey = '';
