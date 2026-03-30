@@ -29,7 +29,7 @@
 
   // Auto-Test form
   let atModel = 'Qwen/Qwen3-0.6B';
-  let atDevice = 'cuda';
+  let atDevice = 'xpu';
   let atDeviceIndex = 0;
   let atTimeout = 7200;
   let atOutput = '/storage/lkk/inference';
@@ -52,7 +52,7 @@
   let aeModelPath = '/kaokao/quantized/Qwen_Qwen3-0.6B-W4A16';
   let aeTasks = 'piqa';
   let aeOutput = '/kaokao/lm_eval_results/Qwen_Qwen3-0.6B';
-  let aeDevice = 'cuda';
+  let aeDevice = 'xpu';
   let aeDeviceIndex = 0;
   let aeBatchSize = 8;
   let aeMaxLen = 8192;
@@ -63,7 +63,7 @@
 
   // Pipeline form
   let plModel = 'Qwen/Qwen3-0.6B';
-  let plDevice = 'cuda';
+  let plDevice = 'xpu';
   let plDeviceIndex = 0;
   let plTimeout = 7200;
   let plSession = 'pipeline';
@@ -94,6 +94,7 @@
   let mcWorkdir = '/wenjiao/openclaw-triton-gen/examples/auto_run';
   let mcOutputRoot = '/storage/lkk/inference';
   let mcSessionDir = '/root/.openclaw/agents/main/sessions';
+  let mcMinimaxKey = '';
 
   $: plEvalInput = plModel && plQuantOutput
     ? `${plQuantOutput}/${plModel.replace(/\//g, '_')}-${plScheme}`
@@ -193,6 +194,8 @@
   async function postAndStream(endpoint: string, body: any) {
     sessionLog = [];
     taskLog = [];
+    sessionUserScrolledUp = false;
+    taskUserScrolledUp = false;
     isRunning = true;
 
     let res: Response;
@@ -348,14 +351,24 @@
 
   let sessionLogEl: HTMLElement;
   let taskLogEl: HTMLElement;
+  let sessionUserScrolledUp = false;
+  let taskUserScrolledUp = false;
 
   function isNearBottom(el: HTMLElement, threshold = 80): boolean {
     return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
   }
 
+  function onSessionScroll() {
+    sessionUserScrolledUp = !isNearBottom(sessionLogEl);
+  }
+
+  function onTaskScroll() {
+    taskUserScrolledUp = !isNearBottom(taskLogEl);
+  }
+
   $: if (sessionLogEl && sessionLog.length > 0) {
     setTimeout(() => {
-      if (isNearBottom(sessionLogEl)) {
+      if (!sessionUserScrolledUp) {
         sessionLogEl.scrollTop = sessionLogEl.scrollHeight;
       }
     }, 0);
@@ -363,7 +376,7 @@
 
   $: if (taskLogEl && taskLog.length > 0) {
     setTimeout(() => {
-      if (isNearBottom(taskLogEl)) {
+      if (!taskUserScrolledUp) {
         taskLogEl.scrollTop = taskLogEl.scrollHeight;
       }
     }, 0);
@@ -452,9 +465,9 @@
         {#if isRunning}
           <button
             on:click={stopCurrent}
-            class="h-10 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
+            class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
           >
-            ◼ Stop
+            Stop
           </button>
         {/if}
       {/if}
@@ -508,7 +521,7 @@
             on:click={stopCurrent}
             class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
           >
-            ◼ Stop
+            Stop
           </button>
         {/if}
       {/if}
@@ -658,7 +671,7 @@
             on:click={stopCurrent}
             class="h-10 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
           >
-            ◼ Stop
+           Stop
           </button>
         {/if}
       {/if}
@@ -814,9 +827,9 @@
         {#if isRunning}
           <button
             on:click={stopCurrent}
-            class="h-10 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
+            class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
           >
-            ◼ Stop
+             Stop
           </button>
         {/if}
       {/if}
@@ -882,7 +895,7 @@
         <div class="px-4 py-3 text-xs font-bold tracking-wider uppercase text-blue-800 border-b-2 border-blue-200 bg-gradient-to-r from-blue-50 to-slate-50">
           Agent Session
         </div>
-        <div bind:this={sessionLogEl} class="flex-1 overflow-y-auto p-4 text-xs font-mono leading-relaxed scrollbar-thin bg-slate-50/50">
+        <div bind:this={sessionLogEl} on:scroll={onSessionScroll} class="flex-1 overflow-y-auto p-4 text-xs font-mono leading-relaxed scrollbar-thin bg-slate-50/50">
           {#each sessionLog as item}
             <div class="py-1 break-words hover:bg-white/60 px-2 -mx-2 rounded transition-colors">
               <span class="text-slate-500 text-[10px] mr-2 select-none font-semibold">{item.timestamp}</span>
@@ -912,7 +925,7 @@
         <div class="px-4 py-3 text-xs font-bold tracking-wider uppercase text-blue-800 border-b-2 border-blue-200 bg-gradient-to-r from-slate-50 to-blue-50">
           Task Log
         </div>
-        <div bind:this={taskLogEl} class="flex-1 overflow-y-auto p-4 text-xs font-mono leading-relaxed scrollbar-thin bg-slate-50/50">
+        <div bind:this={taskLogEl} on:scroll={onTaskScroll} class="flex-1 overflow-y-auto p-4 text-xs font-mono leading-relaxed scrollbar-thin bg-slate-50/50">
           {#each taskLog as item}
             <div class="py-1 break-words hover:bg-white/60 px-2 -mx-2 rounded transition-colors">
               <span class="text-slate-500 text-[10px] mr-2 select-none font-semibold">{item.timestamp}</span>

@@ -8,14 +8,14 @@ A minimal full-stack demo: **SvelteKit** frontend + **FastAPI** backend with rea
 
 ```bash
 cd server
-pip install -r requirements.txt
-uvicorn main:app --reload --port 8000
+pip install fastapi uvicorn
+uvicorn backend:app --host 0.0.0.0 --port 8000
 ```
 
 ### 2. Start the frontend
 
 ```bash
-cd frontend
+cd UI
 npm install
 npm run dev
 ```
@@ -33,7 +33,7 @@ Browser (SvelteKit :5173)
   │
   ├─ POST /api/run ──────────► FastAPI (:8000)
   │                                │
-  │                                └─ subprocess: mock_agent.py
+  │                                └─ docker exec: open-claw agent
   │
   └─ GET  /api/stream/{id} ◄── SSE line-by-line stdout stream
 ```
@@ -43,20 +43,17 @@ Browser (SvelteKit :5173)
 ```
 KernelAgent/
 ├── server/
-│   ├── main.py           # FastAPI main app (routes + SSE)
-│   ├── mock_agent.py     # Mock open-claw agent (line-by-line output, simulates slow task)
-│   └── requirements.txt  # Python dependencies
-├── frontend/
+│   └── backend.py        # FastAPI main app (routes + SSE, docker exec runner)
+├── UI/
 │   ├── package.json
 │   ├── svelte.config.js
-│   ├── vite.config.js
+│   ├── vite.config.ts
 │   └── src/
-│       ├── app.html
-│       └── routes/
-│           └── +page.svelte   # Main page
+│       ├── App.svelte     # Main page
+│       └── main.ts
 └── README.md
 ```
 
 ## Next Step
 
-Replace `server/mock_agent.py` invocation in `main.py` with your real open-claw agent command.
+Update the docker container name and working directory constants at the top of `server/backend.py` to match your environment.
