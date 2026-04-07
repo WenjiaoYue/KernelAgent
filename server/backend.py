@@ -34,6 +34,7 @@ WORKDIR_AUTOEVAL   = "/kaokao/openclaw-triton-gen/examples/auto_run"    # inside
 AUTORUN_SKILL      = "/root/.openclaw/workspace/skills/auto_run/SKILL.md"   # inside docker
 AUTOQUANT_SKILL    = "/root/.openclaw/workspace/skills/auto_quant/SKILL.md" # inside docker
 AUTOEVAL_SKILL     = "/root/.openclaw/workspace/skills/auto_eval/SKILL.md"  # inside docker
+EXCEL_XLX_SKILL    = "/wenjiao/openclaw-triton-gen/skills/excel-xlsx/SKILL.md" # inside docker
 ZIMAGE_LOG         = "/storage/lkk/inference/zimage/logs/zimage.log"   # inside docker
 SESSION_DIR        = "/root/.openclaw/agents/main/sessions"             # inside docker
 
@@ -95,6 +96,15 @@ class ZImageRequest(BaseModel):
     device:              str = "xpu"
     session_key:         str = "zimage_task"
     machine:             MachineConfig = MachineConfig()
+
+
+class ExcelXLXRequest(BaseModel):
+    file_path:   str = ""   # Excel file path inside container (optional)
+    instructions: str = ""  # what to do
+    skill_path:  str = EXCEL_XLX_SKILL
+    session_key: str = "excel_xlx_task"
+    timeout:     int = 300
+    machine:     MachineConfig = MachineConfig()
 
 
 class AutoTestRequest(BaseModel):
@@ -260,8 +270,143 @@ async def _tail_file(queue, task_id, path_in_docker, evt_type, stop, container: 
             pass
 
 
+def _parse_session_line(line: str) -> list[tuple[str, str]]:
+    """Parse one JSONL line from an openclaw session file.
+    Returns list of (sub_type, text) tuples to emit."""
+    results = []
+    try:
+        obj = json.loads(line)
+        msg = obj.get("message")
+        if not msg:
+            return results
+        role = msg.get("role", "")
+        if role == "user":
+            return results
+        content = msg.get("content") or []
+        if isinstance(content, str):
+            content = [{"type": "text", "text": content}]
+        for c in content:
+            t = c.get("type", "")
+            if t == "thinking":
+                results.append(("thinking", c.get("thinking", "")[:800]))
+            elif t == "text":
+                results.append(("text", c.get("text", "")[:8000]))
+            elif t == "toolCall":
+                args = c.get("arguments", {})
+                name = c.get("name", "?")
+                text = f"{name}: {args.get('command', str(args))[:500]}"
+                results.append(("tool_call", text))
+            elif t == "toolResult":
+                r = c.get("content", "")
+                if isinstance(r, list):
+                    r = "".join(x.get("text", "") for x in r)
+                results.append(("tool_result", str(r)[:3000]))
+        # toolResult role messages have their content as direct text items
+        if role == "toolResult" and not results:
+            for c in content:
+                if c.get("type") == "text":
+                    results.append(("tool_result", c.get("text", "")[:3000]))
+    except Exception:
+        pass
+    return results
+
+
+async def _watch_and_tail_session(queue, task_id, session_dir: str, stop, container: str = DOCKER_CONTAINER):
+    """
+    Dynamically find the session JSONL that openclaw is actually writing to,
+    then stream its new content as transcript events.
+
+    openclaw names session files by internal UUID (not by --session-id), and
+    when --agent main is used it continues the existing agent:main:main session.
+    We snapshot sizes before the run, then detect whichever file grows/appears.
+    """
+    # --- Step 1: snapshot all .jsonl files and their sizes ---
+    snap_cmd = (
+        f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' "
+        f"-exec stat -c '%n %s' {{}} + 2>/dev/null || true"
+    )
+    snap_proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "bash", "-c", snap_cmd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await snap_proc.communicate()
+    before: dict[str, int] = {}
+    for ln in out.decode().splitlines():
+        parts = ln.rsplit(None, 1)
+        if len(parts) == 2:
+            before[parts[0]] = int(parts[1])
+
+    # --- Step 2: poll until a file appears or grows ---
+    target_file: str | None = None
+    start_offset: int = 0
+    deadline = time.time() + 60
+    while time.time() < deadline and not stop.is_set():
+        check_proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-c", snap_cmd,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        curr_out, _ = await check_proc.communicate()
+        best_new: str | None = None   # newly created file
+        best_grown: str | None = None  # existing file that grew
+        best_grown_offset: int = 0
+        for ln in curr_out.decode().splitlines():
+            parts = ln.rsplit(None, 1)
+            if len(parts) != 2:
+                continue
+            fname, sz = parts[0], int(parts[1])
+            prev = before.get(fname, -1)
+            if sz > 0:
+                if prev == -1:          # brand-new file
+                    best_new = fname
+                    break
+                elif sz > prev:         # existing file grew
+                    if best_grown is None:
+                        best_grown = fname
+                        best_grown_offset = prev
+        if best_new is not None:
+            target_file = best_new
+            start_offset = 0
+            break
+        if best_grown is not None:
+            target_file = best_grown
+            start_offset = best_grown_offset
+            break
+        await asyncio.sleep(0.5)
+
+    if not target_file or stop.is_set():
+        return
+
+    # --- Step 3: tail from start_offset ---
+    # tail -c +N reads from byte N (1-indexed); +1 = from beginning, +(size+1) = after existing content
+    tail_cmd = f"tail -c +{start_offset + 1} -f {shlex.quote(target_file)}"
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "bash", "-c", tail_cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    buf = ""
+    try:
+        async for raw in proc.stdout:
+            if stop.is_set():
+                break
+            buf += raw.decode(errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                for sub_type, text in _parse_session_line(line):
+                    await queue.put(_evt(task_id, "transcript", text,
+                                        meta={"sub_type": sub_type}))
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
 async def _tail_session_jsonl(queue, task_id, session_file, stop, container: str = DOCKER_CONTAINER):
-    """tail + parse openclaw session JSONL, emit transcript events."""
+    """Legacy: tail a known session file path. Use _watch_and_tail_session when file name is unknown."""
     if not await _wait_file_in_docker(session_file, stop, container=container):
         return
     proc = await asyncio.create_subprocess_exec(
@@ -270,43 +415,20 @@ async def _tail_session_jsonl(queue, task_id, session_file, stop, container: str
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.DEVNULL,
     )
+    buf = ""
     try:
         async for raw in proc.stdout:
             if stop.is_set():
                 break
-            line = raw.decode(errors="replace").strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                msg = obj.get("message", obj)
-                if msg.get("role") == "user":
+            buf += raw.decode(errors="replace")
+            while "\n" in buf:
+                line, buf = buf.split("\n", 1)
+                line = line.strip()
+                if not line:
                     continue
-                content = msg.get("content") or []
-                if isinstance(content, str):
-                    content = [{"type": "text", "text": content}]
-                for c in content:
-                    t = c.get("type", "")
-                    if t == "thinking":
-                        text, sub = c.get("thinking", "")[:500], "thinking"
-                    elif t == "text":
-                        text, sub = c.get("text", "")[:500], "text"
-                    elif t == "toolCall":
-                        args = c.get("arguments", {})
-                        name = c.get("name", "?")
-                        text = f"{name}: {args.get('command', str(args))[:300]}"
-                        sub = "tool_call"
-                    elif t == "toolResult":
-                        r = c.get("content", "")
-                        if isinstance(r, list):
-                            r = "".join(x.get("text", "") for x in r)
-                        text, sub = str(r)[:300], "tool_result"
-                    else:
-                        continue
+                for sub_type, text in _parse_session_line(line):
                     await queue.put(_evt(task_id, "transcript", text,
-                                        meta={"sub_type": sub}))
-            except Exception:
-                pass
+                                        meta={"sub_type": sub_type}))
     finally:
         try:
             proc.kill()
@@ -855,6 +977,232 @@ async def run_pipeline_task(task_id: str, req: PipelineRequest):
         await queue.put(_evt(task_id, "error", str(e), level="error"))
     finally:
         await queue.put(None)
+
+
+# ─────────────────────────── Excel-XLX task ──────────────────────────────
+
+@app.post("/api/run-excel-xlx")
+async def run_excel_xlx(req: ExcelXLXRequest):
+    task_id = str(uuid.uuid4())
+    task_queues[task_id] = asyncio.Queue()
+    asyncio.create_task(run_excel_xlx_task(task_id, req))
+    return {"task_id": task_id}
+
+
+async def run_excel_xlx_task(task_id: str, req: ExcelXLXRequest):
+    queue = task_queues[task_id]
+
+    async def emit(type_, msg, stage="excel_xlx", level="info", meta=None):
+        await queue.put(_evt(task_id, type_, msg, stage, level, meta))
+
+    try:
+        container = req.machine.container
+
+        # Build the message: combine instructions + optional file path + optional skill
+        message = req.instructions.strip()
+        if req.file_path.strip():
+            message = f"{message}\n\nExcel file path: {req.file_path.strip()}"
+        if req.skill_path.strip():
+            message = f"You must follow the skill instructions in: {req.skill_path}\n\n{message}"
+
+        await emit("status", f"Starting Excel-XLX agent: {message[:80]!r}")
+
+        inner = (
+            f"cd {shlex.quote(req.machine.workdir)} && "
+            f"openclaw agent --local --agent main "
+            f"--message {shlex.quote(message)} "
+            f"--timeout {req.timeout}"
+        )
+
+        # Pass MINIMAX_API_KEY and proxy as -e args to docker exec (mirrors the manual command)
+        docker_args = ["docker", "exec"]
+        if req.machine.minimax_key:
+            docker_args += ["-e", f"MINIMAX_API_KEY={req.machine.minimax_key}"]
+        docker_args += [
+            "-e", "https_proxy=http://child-igk.intel.com:912",
+            "-e", "http_proxy=http://child-igk.intel.com:912",
+            container,
+            "bash", "-lc", inner,
+        ]
+
+        # openclaw writes to UUID-named files, not --session-id named files.
+        # Use _watch_and_tail_session to detect whichever file actually gets written.
+        stop_event = asyncio.Event()
+        session_task = asyncio.create_task(
+            _watch_and_tail_session(queue, task_id, req.machine.session_dir, stop_event, container=container)
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *docker_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        async def _drain():
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    await emit("log", line)
+
+        await asyncio.gather(_drain(), proc.wait())
+        rc = proc.returncode
+
+        await asyncio.sleep(3)
+        stop_event.set()
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+
+        if rc == 0:
+            await emit("done", "Excel-XLX agent finished successfully")
+        else:
+            await emit("error", f"Excel-XLX agent exited with code {rc}", level="error")
+
+    except Exception as e:
+        logger.exception("run_excel_xlx_task failed")
+        await queue.put(_evt(task_id, "error", str(e), level="error"))
+    finally:
+        await queue.put(None)
+
+
+@app.post("/api/replay-session")
+async def replay_session(
+    session_dir: str = SESSION_DIR,
+    session_file: str = "",
+    container: str = DOCKER_CONTAINER,
+):
+    """
+    Replay transcript events from an existing session JSONL file.
+    If session_file is empty, uses the most recently modified non-empty .jsonl in session_dir.
+    Returns a task_id; stream events via /api/stream/{task_id}.
+    """
+    task_id = str(uuid.uuid4())
+    task_queues[task_id] = asyncio.Queue()
+
+    async def _replay():
+        queue = task_queues[task_id]
+        try:
+            if not session_file:
+                # Find the most recently modified non-empty .jsonl
+                find_cmd = (
+                    f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' "
+                    f"-exec stat -c '%Y %n' {{}} + 2>/dev/null | sort -rn | head -5"
+                )
+                p = await asyncio.create_subprocess_exec(
+                    "docker", "exec", container, "bash", "-c", find_cmd,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                )
+                out, _ = await p.communicate()
+                target = None
+                for ln in out.decode().splitlines():
+                    parts = ln.split(None, 1)
+                    if len(parts) == 2:
+                        candidate = parts[1].strip()
+                        # Skip empty files
+                        sz_p = await asyncio.create_subprocess_exec(
+                            "docker", "exec", container, "bash", "-c",
+                            f"stat -c%s {shlex.quote(candidate)} 2>/dev/null",
+                            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        sz_out, _ = await sz_p.communicate()
+                        if sz_out.strip() and int(sz_out.strip()) > 0:
+                            target = candidate
+                            break
+                if not target:
+                    await queue.put(_evt(task_id, "error", "No non-empty session file found", level="error"))
+                    return
+            else:
+                target = session_file
+
+            await queue.put(_evt(task_id, "status", f"Replaying session: {target}"))
+
+            # Read entire file and emit transcript events
+            cat_proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", container, "cat", target,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            out, _ = await cat_proc.communicate()
+            for line in out.decode(errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                for sub_type, text in _parse_session_line(line):
+                    await queue.put(_evt(task_id, "transcript", text,
+                                        meta={"sub_type": sub_type}))
+            await queue.put(_evt(task_id, "done", f"Replay complete: {target}"))
+        except Exception as e:
+            await queue.put(_evt(task_id, "error", str(e), level="error"))
+        finally:
+            await queue.put(None)
+
+    asyncio.create_task(_replay())
+    return {"task_id": task_id}
+
+
+@app.get("/api/list-sessions")
+async def list_sessions(
+    session_dir: str = SESSION_DIR,
+    container: str = DOCKER_CONTAINER,
+):
+    """List all session JSONL files in session_dir with their sizes and modification times."""
+    cmd = (
+        f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' "
+        f"-exec stat -c '%Y %s %n' {{}} + 2>/dev/null | sort -rn"
+    )
+    p = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "bash", "-c", cmd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await p.communicate()
+    sessions = []
+    for ln in out.decode().splitlines():
+        parts = ln.split(None, 2)
+        if len(parts) == 3:
+            mtime, size, path = int(parts[0]), int(parts[1]), parts[2].strip()
+            sessions.append({
+                "path": path,
+                "name": path.rsplit("/", 1)[-1],
+                "size": size,
+                "mtime": mtime,
+            })
+    return {"sessions": sessions}
+
+
+@app.get("/api/read-xlsx")
+async def read_xlsx(path: str, container: str = DOCKER_CONTAINER):
+    """Read an xlsx file from inside Docker and return it as markdown tables."""
+    if not path.startswith("/"):
+        raise HTTPException(status_code=400, detail="path must be absolute")
+    script = (
+        "import openpyxl, json, sys; "
+        f"wb = openpyxl.load_workbook({repr(path)}, read_only=True, data_only=True); "
+        "result = {}; "
+        "[result.update({name: [list(r) for r in wb[name].iter_rows(values_only=True)]}) for name in wb.sheetnames]; "
+        "print(json.dumps(result, default=str))"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "python3", "-c", script,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise HTTPException(status_code=500, detail=stderr.decode(errors="replace")[:500])
+    data = json.loads(stdout.decode())
+    md = ""
+    for sheet, rows in data.items():
+        md += f"## {sheet}\n\n"
+        if rows:
+            header = [str(c) if c is not None else "" for c in rows[0]]
+            md += "| " + " | ".join(header) + " |\n"
+            md += "| " + " | ".join("---" for _ in header) + " |\n"
+            for row in rows[1:]:
+                cells = [str(c) if c is not None else "" for c in row]
+                md += "| " + " | ".join(cells) + " |\n"
+        md += "\n"
+    return {"markdown": md}
 
 
 @app.get("/api/image")

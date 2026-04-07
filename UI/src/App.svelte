@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onDestroy } from 'svelte';
 
-  type Tab = 'zimage' | 'autotest' | 'autoquant' | 'autoeval' | 'pipeline';
+  type Tab = 'zimage' | 'excelxlx' | 'pipeline';
   type LogItem = {
     timestamp: string;
     type: string;
@@ -27,40 +27,12 @@
   let ziOutput = '/storage/lkk/inference/zimage/zimage_output.png';
   let ziSession = 'zimage_task';
 
-  // Auto-Test form
-  let atModel = 'Qwen/Qwen3-0.6B';
-  let atDevice = 'xpu';
-  let atDeviceIndex = 0;
-  let atTimeout = 7200;
-  let atOutput = '/storage/lkk/inference';
-  let atSkill = '/root/.openclaw/workspace/skills/auto_run/SKILL.md';
-  let atSession = 'autotest_task';
-
-  // Auto-Quant form
-  let aqModel = 'Qwen/Qwen3-0.6B';
-  let aqScheme = 'W4A16';
-  let aqMethod = 'RTN';
-  let aqExport = 'auto_round:auto_gptq';
-  let aqDevice = 'xpu';
-  let aqDeviceIndex = 0;
-  let aqTimeout = 7200;
-  let aqOutput = '/kaokao/quantized';
-  let aqSkill = '/root/.openclaw/workspace/skills/auto_quant/SKILL.md';
-  let aqSession = 'autoquant_task';
-
-  // Auto-Eval form
-  let aeModelPath = '/kaokao/quantized/Qwen_Qwen3-0.6B-W4A16';
-  let aeTasks = 'piqa';
-  let aeOutput = '/kaokao/lm_eval_results/Qwen_Qwen3-0.6B';
-  let aeDevice = 'xpu';
-  let aeDeviceIndex = 0;
-  let aeBatchSize = 8;
-  let aeMaxLen = 8192;
-  let aeGpuMem = 0.8;
-  let aeSkill = '/root/.openclaw/workspace/skills/auto_eval/SKILL.md';
-  let aeSession = 'autoeval_task';
-  let aeTimeout = 7200;
-
+  // Excel-XLX form
+  let xlxFilePath = '/tmp/agent_profiling_swe_2core.xlsx';
+  let xlxInstructions = 'Read all sheet names and the first 5 rows of each sheet, display in table format';
+  let xlxSkill = '/wenjiao/openclaw-triton-gen/skills/excel-xlsx/SKILL.md';
+  let xlxSession = 'excel_xlx_task';
+  let xlxTimeout = 300;  let xlxFileContent = '';   // rendered markdown from /api/read-xlsx
   // Pipeline form
   let plModel = 'Qwen/Qwen3-0.6B';
   let plDevice = 'xpu';
@@ -89,9 +61,9 @@
   let mcUser = 'kaokao';
   let mcPassword = '';
 
-  let mcContainer = 'test_clawd';
-  let mcRepoRoot = '/kaokao/openclaw-triton-gen';
-  let mcWorkdir = '/kaokao/openclaw-triton-gen/examples/auto_run';
+  let mcContainer = 'xpu-openclaw';
+  let mcRepoRoot = '/wenjiao/openclaw-triton-gen';
+  let mcWorkdir = '/wenjiao/openclaw-triton-gen/examples/auto_run';
   let mcOutputRoot = '/storage/lkk/inference';
   let mcSessionDir = '/root/.openclaw/agents/main/sessions';
   let mcMinimaxKey = '';
@@ -238,60 +210,17 @@
     });
   }
 
-  function runAutoTest() {
-    if (!atModel.trim()) {
-      alert('Please enter a Model ID');
+  function runExcelXLX() {
+    if (!xlxInstructions.trim()) {
+      alert('Please enter instructions');
       return;
     }
-    postAndStream('/api/run-autotest', {
-      model_id: atModel,
-      device: atDevice,
-      device_index: String(atDeviceIndex),
-      output_dir: atOutput,
-      skill_path: atSkill,
-      session_key: atSession || 'autotest_task',
-      timeout: atTimeout,
-      machine: getMachineConfig(),
-    });
-  }
-
-  function runAutoQuant() {
-    if (!aqModel.trim()) {
-      alert('Please enter a Model ID');
-      return;
-    }
-    postAndStream('/api/run-autoquant', {
-      model_id: aqModel,
-      scheme: aqScheme,
-      method: aqMethod,
-      export_format: aqExport,
-      device: aqDevice,
-      device_index: String(aqDeviceIndex),
-      output_dir: aqOutput,
-      skill_path: aqSkill,
-      session_key: aqSession || 'autoquant_task',
-      timeout: aqTimeout,
-      machine: getMachineConfig(),
-    });
-  }
-
-  function runAutoEval() {
-    if (!aeModelPath.trim()) {
-      alert('Please enter a Model Path');
-      return;
-    }
-    postAndStream('/api/run-autoeval', {
-      model_path: aeModelPath,
-      tasks: aeTasks,
-      output_dir: aeOutput,
-      device: aeDevice,
-      device_index: String(aeDeviceIndex),
-      batch_size: aeBatchSize,
-      max_model_len: aeMaxLen,
-      gpu_memory_utilization: aeGpuMem,
-      skill_path: aeSkill,
-      session_key: aeSession || 'autoeval_task',
-      timeout: aeTimeout,
+    postAndStream('/api/run-excel-xlx', {
+      file_path: xlxFilePath,
+      instructions: xlxInstructions,
+      skill_path: xlxSkill,
+      session_key: xlxSession || 'excel_xlx_task',
+      timeout: xlxTimeout,
       machine: getMachineConfig(),
     });
   }
@@ -338,6 +267,68 @@
     }
     isRunning = false;
     sessionLog = appendLog(sessionLog, { timestamp: ts(), type: 'error', message: 'Manually stopped' });
+  }
+
+  // ─── Markdown table renderer ─────────────────────────────────────────────
+  function escHtml(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  function renderMsg(text: string): string {
+    const lines = text.split('\n');
+    let html = '';
+    let tbl: string[] = [];
+
+    const flush = () => {
+      if (!tbl.length) return;
+      html += '<div class="overflow-x-auto my-1"><table class="border-collapse text-xs w-max">';
+      let firstRow = true;
+      let hasHeader = tbl.some(l => /^\|[\s\-:|]+\|$/.test(l.trim()));
+      for (const l of tbl) {
+        const t = l.trim();
+        const inner = t.slice(1, -1);
+        if (/^[\s\-:|]+$/.test(inner)) { firstRow = false; continue; }
+        const cells = inner.split('|');
+        const isHdr = firstRow && hasHeader;
+        const tag = isHdr ? 'th' : 'td';
+        const cls = isHdr
+          ? 'border border-slate-400 px-2 py-1 bg-slate-100 font-semibold whitespace-nowrap'
+          : 'border border-slate-300 px-2 py-0.5 whitespace-nowrap even:bg-slate-50';
+        html += '<tr>' + cells.map(c => `<${tag} class="${cls}">${escHtml(c.trim())}</${tag}>`).join('') + '</tr>';
+        if (firstRow) firstRow = false;
+      }
+      html += '</table></div>';
+      tbl = [];
+    };
+
+    for (const line of lines) {
+      const t = line.trim();
+      if (t.startsWith('|') && t.endsWith('|') && t.length > 2) {
+        tbl.push(line);
+      } else {
+        flush();
+        html += (t ? `<div>${escHtml(line)}</div>` : '<div class="h-1"></div>');
+      }
+    }
+    flush();
+    return html;
+  }
+
+  // ─── View xlsx file from container ───────────────────────────────────────
+  async function readXlsxFile() {
+    if (!xlxFilePath.trim()) { alert('Please enter an Excel file path'); return; }
+    xlxFileContent = 'Loading...';
+    const mc = getMachineConfig();
+    try {
+      const res = await fetch(
+        `${BACKEND}/api/read-xlsx?path=${encodeURIComponent(xlxFilePath)}&container=${encodeURIComponent(mc.container)}`
+      );
+      if (!res.ok) { const t = await res.text(); xlxFileContent = 'Error: ' + t; return; }
+      const { markdown } = await res.json();
+      xlxFileContent = markdown;
+    } catch (e: any) {
+      xlxFileContent = 'Error: ' + e.message;
+    }
   }
 
   function clearPanels() {
@@ -393,22 +384,10 @@
       Z-Image
     </button>
     <button
-      on:click={() => currentTab = 'autotest'}
-      class="px-6 py-2 text-sm font-semibold border border-b-0 rounded-t-lg transition-all {currentTab === 'autotest' ? 'bg-white text-blue-700 border-blue-200 shadow-sm' : 'bg-slate-100/80 text-slate-600 border-transparent hover:bg-slate-200/80 hover:text-slate-900'}"
+      on:click={() => currentTab = 'excelxlx'}
+      class="px-6 py-2 text-sm font-semibold border border-b-0 rounded-t-lg transition-all {currentTab === 'excelxlx' ? 'bg-white text-blue-700 border-blue-200 shadow-sm' : 'bg-slate-100/80 text-slate-600 border-transparent hover:bg-slate-200/80 hover:text-slate-900'}"
     >
-      Auto-Test
-    </button>
-    <button
-      on:click={() => currentTab = 'autoquant'}
-      class="px-6 py-2 text-sm font-semibold border border-b-0 rounded-t-lg transition-all {currentTab === 'autoquant' ? 'bg-white text-blue-700 border-blue-200 shadow-sm' : 'bg-slate-100/80 text-slate-600 border-transparent hover:bg-slate-200/80 hover:text-slate-900'}"
-    >
-      Auto-Quant
-    </button>
-    <button
-      on:click={() => currentTab = 'autoeval'}
-      class="px-6 py-2 text-sm font-semibold border border-b-0 rounded-t-lg transition-all {currentTab === 'autoeval' ? 'bg-white text-blue-700 border-blue-200 shadow-sm' : 'bg-slate-100/80 text-slate-600 border-transparent hover:bg-slate-200/80 hover:text-slate-900'}"
-    >
-      Auto-Eval
+      Excel-XLX
     </button>
     <button
       on:click={() => currentTab = 'pipeline'}
@@ -472,208 +451,39 @@
         {/if}
       {/if}
 
-      <!-- Auto-Test Form -->
-      {#if currentTab === 'autotest'}
-        <h2 class="text-base font-bold text-blue-700 tracking-wide mb-1">Auto-Test</h2>
+      <!-- Excel-XLX Form -->
+      {#if currentTab === 'excelxlx'}
+        <h2 class="text-base font-bold text-blue-700 tracking-wide mb-1">Excel-XLX Agent</h2>
         <div>
-          <label class="block text-xs text-gray-600 mb-1">Model ID</label>
-          <input type="text" bind:value={atModel} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+          <label class="block text-xs font-semibold text-slate-700 mb-1.5">Excel File Path (in container)</label>
+          <input type="text" bind:value={xlxFilePath} placeholder="/tmp/xxx.xlsx" class="w-full h-8 bg-white border-2 border-slate-300 text-slate-900 rounded-lg px-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm" />
         </div>
         <div>
-          <label class="block text-xs text-gray-600 mb-1">Device</label>
-          <select bind:value={atDevice} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-            <option value="cuda">CUDA (NVIDIA GPU)</option>
-            <option value="xpu">XPU (Intel GPU)</option>
-            <option value="cpu">CPU</option>
-          </select>
+          <label class="block text-xs font-semibold text-slate-700 mb-1.5">Instructions</label>
+          <textarea bind:value={xlxInstructions} rows="5" placeholder="Read all sheet names and the first 5 rows of each sheet, display in table format" class="w-full bg-white border-2 border-slate-300 text-slate-900 rounded-lg px-3 py-2 text-sm resize-y focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 shadow-sm"></textarea>
+        </div>
+        <div>
+          <label class="block text-xs text-gray-600 mb-1">Skill Path (optional)</label>
+          <input type="text" bind:value={xlxSkill} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
         </div>
         <div class="flex gap-2">
           <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Device Index</label>
-            <input type="number" bind:value={atDeviceIndex} min="0" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+            <label class="block text-xs text-gray-600 mb-1">Session Key</label>
+            <input type="text" bind:value={xlxSession} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
           </div>
           <div class="flex-1">
             <label class="block text-xs text-gray-600 mb-1">Timeout (s)</label>
-            <input type="number" bind:value={atTimeout} min="60" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
+            <input type="number" bind:value={xlxTimeout} min="60" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
           </div>
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Output Dir</label>
-          <input type="text" bind:value={atOutput} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Skill Path</label>
-          <input type="text" bind:value={atSkill} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Session Key</label>
-          <input type="text" bind:value={atSession} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
         </div>
         <button
-          on:click={runAutoTest}
+          on:click={runExcelXLX}
           disabled={isRunning}
-          class="h-10 p-2  bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
+          class="h-10 p-2 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
         >
-          ▶ Run Test
+          ▶ Run Excel-XLX
         </button>
-        {#if isRunning}
-          <button
-            on:click={stopCurrent}
-            class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
-          >
-            Stop
-          </button>
-        {/if}
-      {/if}
-
-      <!-- Auto-Quant Form -->
-      {#if currentTab === 'autoquant'}
-        <h2 class="text-base font-bold text-blue-700 tracking-wide mb-1">Auto-Quant</h2>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Model ID</label>
-          <input type="text" bind:value={aqModel} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div class="flex gap-2">
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Scheme</label>
-            <select bind:value={aqScheme} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-              <option value="W4A16">W4A16</option>
-              <option value="W8A8">W8A8</option>
-              <option value="mxfp4">mxfp4</option>
-              <option value="W4A8">W4A8</option>
-              <option value="W2A16">W2A16</option>
-            </select>
-          </div>
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Method</label>
-            <select bind:value={aqMethod} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-              <option value="RTN">RTN</option>
-              <option value="GPTQ">GPTQ</option>
-              <option value="AutoRound">AutoRound</option>
-            </select>
-          </div>
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Export Format</label>
-          <input type="text" bind:value={aqExport} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Device</label>
-          <select bind:value={aqDevice} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-            <option value="xpu">XPU (Intel GPU)</option>
-            <option value="cuda">CUDA (NVIDIA GPU)</option>
-            <option value="cpu">CPU</option>
-          </select>
-        </div>
-        <div class="flex gap-2">
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Device Index</label>
-            <input type="number" bind:value={aqDeviceIndex} min="0" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Timeout (s)</label>
-            <input type="number" bind:value={aqTimeout} min="60" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Output Dir</label>
-          <input type="text" bind:value={aqOutput} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Skill Path</label>
-          <input type="text" bind:value={aqSkill} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Session Key</label>
-          <input type="text" bind:value={aqSession} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <button
-          on:click={runAutoQuant}
-          disabled={isRunning}
-          class="h-10 p-2  bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
-        >
-          ▶ Quantize
-        </button>
-        {#if isRunning}
-          <button
-            on:click={stopCurrent}
-            class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
-          >
-             Stop
-          </button>
-        {/if}
-      {/if}
-
-      <!-- Auto-Eval Form -->
-      {#if currentTab === 'autoeval'}
-        <h2 class="text-base font-bold text-blue-700 tracking-wide mb-1">Auto-Eval</h2>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Model Path</label>
-          <input type="text" bind:value={aeModelPath} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Tasks</label>
-          <input type="text" bind:value={aeTasks} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Output Dir</label>
-          <input type="text" bind:value={aeOutput} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Device</label>
-          <select bind:value={aeDevice} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-            <option value="cuda">CUDA (NVIDIA GPU)</option>
-            <option value="xpu">XPU (Intel GPU)</option>
-            <option value="cpu">CPU</option>
-          </select>
-        </div>
-        <div class="flex gap-2">
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Device Index</label>
-            <input type="number" bind:value={aeDeviceIndex} min="0" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Batch Size</label>
-            <input type="number" bind:value={aeBatchSize} min="1" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-        </div>
-        <div class="flex gap-2">
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">Max Model Len</label>
-            <input type="number" bind:value={aeMaxLen} min="128" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-          <div class="flex-1">
-            <label class="block text-xs text-gray-600 mb-1">GPU Mem Util</label>
-            <input type="number" bind:value={aeGpuMem} min="0.1" max="1.0" step="0.05" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-          </div>
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Skill Path</label>
-          <input type="text" bind:value={aeSkill} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Session Key</label>
-          <input type="text" bind:value={aeSession} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <div>
-          <label class="block text-xs text-gray-600 mb-1">Timeout (s)</label>
-          <input type="number" bind:value={aeTimeout} min="60" class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent" />
-        </div>
-        <button
-          on:click={runAutoEval}
-          disabled={isRunning}
-          class="h-10 p-2  bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
-        >
-          ▶ Evaluate
-        </button>
-        {#if isRunning}
-          <button
-            on:click={stopCurrent}
-            class="h-10 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
-          >
-           Stop
-          </button>
-        {/if}
+       
       {/if}
 
       <!-- Pipeline Form -->
@@ -686,8 +496,8 @@
         <div>
           <label class="block text-xs text-gray-600 mb-1">Device</label>
           <select bind:value={plDevice} class="w-full h-8 bg-white border border-gray-300 text-gray-900 rounded-md px-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent">
-            <option value="cuda">CUDA (NVIDIA GPU)</option>
             <option value="xpu">XPU (Intel GPU)</option>
+            <option value="cuda">CUDA (NVIDIA GPU)</option>
             <option value="cpu">CPU</option>
           </select>
         </div>
@@ -820,7 +630,7 @@
         <button
           on:click={runPipeline}
           disabled={isRunning}
-          class="h-10 p-2  bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
+          class="h-10 p-2 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-lg font-bold text-sm hover:from-blue-700 hover:to-blue-800 disabled:from-slate-300 disabled:to-slate-400 disabled:text-slate-500 disabled:cursor-not-allowed transition-all shadow-md hover:shadow-lg disabled:shadow-none"
         >
           ▶ Run Pipeline
         </button>
@@ -829,7 +639,7 @@
             on:click={stopCurrent}
             class="h-10 p-2 bg-gradient-to-r from-red-600 to-red-700 text-white rounded-lg font-bold text-sm hover:from-red-700 hover:to-red-800 transition-all shadow-md hover:shadow-lg"
           >
-             Stop
+            Stop
           </button>
         {/if}
       {/if}
@@ -897,7 +707,7 @@
         </div>
         <div bind:this={sessionLogEl} on:scroll={onSessionScroll} class="flex-1 overflow-y-auto p-4 text-xs font-mono leading-relaxed scrollbar-thin bg-slate-50/50">
           {#each sessionLog as item}
-            <div class="py-1 break-words hover:bg-white/60 px-2 -mx-2 rounded transition-colors">
+            <div class="py-1 overflow-x-auto hover:bg-white/60 px-2 -mx-2 rounded transition-colors">
               <span class="text-slate-500 text-[10px] mr-2 select-none font-semibold">{item.timestamp}</span>
               {#if item.tag}
                 <span class="text-[10px] mr-1.5 px-2 py-0.5 rounded-md align-middle font-semibold
@@ -907,15 +717,18 @@
                   {item.type === 'text' ? 'bg-blue-200 text-blue-900' : ''}
                 ">[{item.tag}]</span>
               {/if}
-              <span class="
-                {item.type === 'thinking' ? 'text-slate-600 italic' : ''}
-                {item.type === 'tool_call' ? 'text-purple-700 font-medium' : ''}
-                {item.type === 'tool_result' ? 'text-emerald-700 font-medium' : ''}
-                {item.type === 'text' ? 'text-slate-800' : ''}
-                {item.type === 'status' ? 'text-blue-700 font-semibold' : ''}
-                {item.type === 'done' ? 'text-green-700 font-bold' : ''}
-                {item.type === 'error' ? 'text-red-700 font-bold' : ''}
-              ">{item.message}</span>
+              {#if item.type === 'text' || item.type === 'tool_result'}
+                <div class="mt-0.5 {item.type === 'text' ? 'text-slate-800' : 'text-emerald-700 font-medium'}">{@html renderMsg(item.message)}</div>
+              {:else if item.type === 'done'}
+                <div class="mt-0.5 text-green-700 font-bold">{@html renderMsg(item.message)}</div>
+              {:else}
+                <span class="
+                  {item.type === 'thinking' ? 'text-slate-600 italic' : ''}
+                  {item.type === 'tool_call' ? 'text-purple-700 font-medium' : ''}
+                  {item.type === 'status' ? 'text-blue-700 font-semibold' : ''}
+                  {item.type === 'error' ? 'text-red-700 font-bold' : ''}
+                ">{item.message}</span>
+              {/if}
             </div>
           {/each}
         </div>
@@ -945,6 +758,18 @@
           </div>
           <div class="flex-1 flex items-center justify-center p-6 bg-gradient-to-br from-slate-50 to-blue-50 overflow-hidden">
             <img src={zimageImgSrc} alt="" class="max-w-full max-h-full object-contain rounded-xl shadow-2xl border-2 border-blue-200" />
+          </div>
+        </div>
+      {/if}
+
+      {#if currentTab === 'excelxlx' && xlxFileContent}
+        <div class="flex-1 flex flex-col overflow-hidden bg-white border-l border-blue-200">
+          <div class="px-4 py-3 text-xs font-bold tracking-wider uppercase text-blue-800 border-b-2 border-blue-200 bg-gradient-to-r from-emerald-50 to-slate-50 flex items-center justify-between">
+            <span>File Preview: {xlxFilePath}</span>
+            <button on:click={() => xlxFileContent = ''} class="text-slate-400 hover:text-slate-700 ml-2 font-bold">✕</button>
+          </div>
+          <div class="flex-1 overflow-auto p-4 text-xs font-mono bg-slate-50/50">
+            {@html renderMsg(xlxFileContent)}
           </div>
         </div>
       {/if}
