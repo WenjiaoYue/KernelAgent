@@ -17,6 +17,9 @@ import os
 import shlex
 import time
 import uuid
+import urllib.request
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,6 +47,7 @@ PROXY_EXPORTS = (
 )
 
 _HERE   = os.path.dirname(os.path.abspath(__file__))
+_UI_DIST = os.path.join(os.path.dirname(_HERE), "UI", "dist")
 
 app = FastAPI()
 app.add_middleware(
@@ -54,7 +58,7 @@ app.add_middleware(
 )
 
 try:
-    app.mount("/static", StaticFiles(directory=_HERE), name="static")
+    app.mount("/static", StaticFiles(directory=_UI_DIST, html=True), name="static")
 except Exception:
     pass
 
@@ -1005,7 +1009,7 @@ async def run_excel_xlx_task(task_id: str, req: ExcelXLXRequest):
         if req.skill_path.strip():
             message = f"You must follow the skill instructions in: {req.skill_path}\n\n{message}"
 
-        await emit("status", f"Starting Excel-XLX agent: {message[:80]!r}")
+        await emit("status", f"Starting Excel-XLX agent | file={req.file_path.strip() or '(none)'} | instructions={req.instructions.strip()[:300]}")
 
         inner = (
             f"cd {shlex.quote(req.machine.workdir)} && "
@@ -1025,8 +1029,17 @@ async def run_excel_xlx_task(task_id: str, req: ExcelXLXRequest):
             "bash", "-lc", inner,
         ]
 
-        # openclaw writes to UUID-named files, not --session-id named files.
-        # Use _watch_and_tail_session to detect whichever file actually gets written.
+        # Clear all existing session files for the main agent so it has no prior memory
+        clear_sessions_cmd = (
+            f"find {shlex.quote(req.machine.session_dir)} -maxdepth 1 -name '*.jsonl' "
+            f"-exec truncate -s 0 {{}} + 2>/dev/null || true"
+        )
+        clear_proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-c", clear_sessions_cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await clear_proc.wait()
+
         stop_event = asyncio.Event()
         session_task = asyncio.create_task(
             _watch_and_tail_session(queue, task_id, req.machine.session_dir, stop_event, container=container)
@@ -1170,6 +1183,45 @@ async def list_sessions(
     return {"sessions": sessions}
 
 
+@app.get("/api/download-session")
+async def download_session(
+    session_dir: str = SESSION_DIR,
+    container: str = DOCKER_CONTAINER,
+):
+    """Download the most recently modified non-empty session JSONL file from the container."""
+    # Find most recent non-empty .jsonl
+    cmd = (
+        f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' -size +0c "
+        f"-exec stat -c '%Y %n' {{}} + 2>/dev/null | sort -rn | head -1"
+    )
+    p = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "bash", "-c", cmd,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    out, _ = await p.communicate()
+    line = out.decode().strip()
+    if not line:
+        raise HTTPException(status_code=404, detail="No session file found")
+    parts = line.split(None, 1)
+    if len(parts) < 2:
+        raise HTTPException(status_code=404, detail="No session file found")
+    target = parts[1].strip()
+    filename = target.rsplit("/", 1)[-1]
+
+    cat_proc = await asyncio.create_subprocess_exec(
+        "docker", "exec", container, "cat", target,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+    )
+    data, _ = await cat_proc.communicate()
+    if not data:
+        raise HTTPException(status_code=404, detail="Session file is empty")
+    return Response(
+        content=data,
+        media_type="application/x-ndjson",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @app.get("/api/read-xlsx")
 async def read_xlsx(path: str, container: str = DOCKER_CONTAINER):
     """Read an xlsx file from inside Docker and return it as markdown tables."""
@@ -1222,6 +1274,180 @@ async def get_image(path: str, container: str = DOCKER_CONTAINER):
     ct = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
           "gif": "image/gif", "webp": "image/webp"}.get(ext, "application/octet-stream")
     return Response(content=data, media_type=ct)
+
+
+# ─────────────────────────── HF Model Discovery ──────────────────────────
+
+# Direct HF API (no agent round-trip)
+_HF_PROXY = os.environ.get("https_proxy") or os.environ.get("http_proxy") or "http://child-igk.intel.com:912"
+_hf_opener = urllib.request.build_opener(
+    urllib.request.ProxyHandler({"https": _HF_PROXY, "http": _HF_PROXY})
+)
+
+
+def _hf_api(path: str, params: dict | None = None):
+    url = "https://huggingface.co/api/" + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"User-Agent": "KernelAgent/1.0"})
+    with _hf_opener.open(req, timeout=30) as resp:
+        return json.loads(resp.read().decode())
+
+
+class HFModelsRequest(BaseModel):
+    days:         int = 10
+    limit:        int = 20
+    sort:         str = "createdAt"
+    pipeline_tag: str = ""
+
+
+@app.post("/api/hf-models")
+async def hf_models_direct(req: HFModelsRequest):
+    """Query HuggingFace API directly — fast, no agent."""
+    import asyncio
+    loop = asyncio.get_event_loop()
+    models = await loop.run_in_executor(None, _hf_list_models, req)
+    return {"models": models}
+
+
+def _hf_list_models(req: HFModelsRequest) -> list[dict]:
+    params: dict = {
+        "sort": req.sort,
+        "direction": -1,
+        "limit": min(req.limit * 3, 100),
+        "full": "false",
+    }
+    if req.pipeline_tag:
+        params["pipeline_tag"] = req.pipeline_tag
+
+    raw = _hf_api("models", params)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=req.days)
+    results = []
+    for m in raw:
+        created = m.get("createdAt", "")
+        if created:
+            try:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if dt < cutoff:
+                continue
+        results.append({
+            "id": m.get("id", ""),
+            "pipeline_tag": m.get("pipeline_tag", ""),
+            "likes": m.get("likes", 0),
+            "downloads": m.get("downloads", 0),
+            "createdAt": created,
+        })
+        if len(results) >= req.limit:
+            break
+    return results
+
+
+class HFDiscoverRequest(BaseModel):
+    days:         int = 10
+    limit:        int = 20
+    sort:         str = "createdAt"     # createdAt | downloads | likes
+    pipeline_tag: str = ""              # e.g. text-generation
+    timeout:      int = 120
+    session_key:  str = "hf_discover"
+    machine:      MachineConfig = MachineConfig()
+
+
+@app.post("/api/run-hf-discover")
+async def run_hf_discover(req: HFDiscoverRequest):
+    task_id = str(uuid.uuid4())
+    task_queues[task_id] = asyncio.Queue()
+    asyncio.create_task(run_hf_discover_task(task_id, req))
+    return {"task_id": task_id}
+
+
+async def run_hf_discover_task(task_id: str, req: HFDiscoverRequest):
+    queue = task_queues[task_id]
+
+    async def emit(type_, msg, stage="hf_discover", level="info", meta=None):
+        await queue.put(_evt(task_id, type_, msg, stage, level, meta))
+
+    try:
+        container = req.machine.container
+        tag_hint = f" (pipeline_tag={req.pipeline_tag})" if req.pipeline_tag else ""
+        message = (
+            f"Use the huggingface MCP tool to list the {req.limit} most recently "
+            f"created models in the last {req.days} days, sorted by {req.sort}{tag_hint}. "
+            f"Return the results as a JSON array with fields: id, pipeline_tag, likes, downloads, createdAt. "
+            f"IMPORTANT: The tool has a built-in org whitelist and license filter. "
+            f"If the result is empty, just return an empty array []. "
+            f"Do NOT try alternative approaches, do NOT remove filters, do NOT use web search or other tools. "
+            f"Simply report the empty result."
+        )
+
+        await emit("status", f"Discovering HF models | days={req.days} limit={req.limit} sort={req.sort}{tag_hint}")
+
+        inner = (
+            f"cd {shlex.quote(req.machine.workdir)} && "
+            f"openclaw agent --local --agent main "
+            f"--message {shlex.quote(message)} "
+            f"--timeout {req.timeout}"
+        )
+
+        docker_args = ["docker", "exec"]
+        if req.machine.minimax_key:
+            docker_args += ["-e", f"MINIMAX_API_KEY={req.machine.minimax_key}"]
+        docker_args += [
+            "-e", "https_proxy=http://child-igk.intel.com:912",
+            "-e", "http_proxy=http://child-igk.intel.com:912",
+            container,
+            "bash", "-lc", inner,
+        ]
+
+        clear_sessions_cmd = (
+            f"find {shlex.quote(req.machine.session_dir)} -maxdepth 1 -name '*.jsonl' "
+            f"-exec truncate -s 0 {{}} + 2>/dev/null || true"
+        )
+        clear_proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-c", clear_sessions_cmd,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        )
+        await clear_proc.wait()
+
+        stop_event = asyncio.Event()
+        session_task = asyncio.create_task(
+            _watch_and_tail_session(queue, task_id, req.machine.session_dir, stop_event, container=container)
+        )
+
+        proc = await asyncio.create_subprocess_exec(
+            *docker_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        async def _drain():
+            async for raw in proc.stdout:
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    await emit("log", line)
+
+        await asyncio.gather(_drain(), proc.wait())
+        rc = proc.returncode
+
+        await asyncio.sleep(3)
+        stop_event.set()
+        session_task.cancel()
+        try:
+            await session_task
+        except asyncio.CancelledError:
+            pass
+
+        if rc == 0:
+            await emit("done", "HF model discovery finished")
+        else:
+            await emit("error", f"HF discover agent exited with code {rc}", level="error")
+
+    except Exception as e:
+        logger.exception("run_hf_discover_task failed")
+        await queue.put(_evt(task_id, "error", str(e), level="error"))
+    finally:
+        await queue.put(None)
 
 
 @app.get("/api/stream/{task_id}")

@@ -91,7 +91,32 @@ curl -L https://huggingface.co/{model_id}/resolve/main/tokenizer_config.json -o 
 
 ## Step 2: Set Up Environment (MANDATORY)
 
-**IMPORTANT: Always create an isolated virtual environment. Never run on system Python.**
+**IMPORTANT: Always use an isolated virtual environment. Never run on system Python.**
+
+### Step 2.0 — Reuse Existing Environment (CHECK FIRST!)
+
+**Before creating anything, check if a venv already exists in the output directory:**
+
+```bash
+if [ -f {output_dir}/venv/bin/activate ]; then
+    echo "EXISTING VENV FOUND — reusing it"
+    source {output_dir}/venv/bin/activate
+    python -c "import torch; print('torch:', torch.__version__)" && echo "VENV OK"
+fi
+```
+
+**If the venv exists and torch imports correctly → skip Step 2.1–2.4 entirely.** Just activate it and proceed to Step 3.
+
+Only create a new venv if:
+- No venv exists at `{output_dir}/venv/`
+- The existing venv is broken (torch import fails)
+- The existing venv has the wrong device backend
+
+Similarly, **do NOT re-download model weights** if they already exist in `$HF_HOME`:
+```bash
+# Check if model is already cached
+ls $HF_HOME/hub/models--{org}--{model_name}/snapshots/ 2>/dev/null && echo "MODEL CACHED"
+```
 
 ### Step 2.1 — Check What's Already in the System
 
