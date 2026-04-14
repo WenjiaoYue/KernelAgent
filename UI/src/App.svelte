@@ -38,11 +38,24 @@
   // Active-tab helpers that write into the correct tab's state
   let activeTab: Tab = 'zimage';  // tracks which tab owns the running task
 
+  const MAX_LOG_ITEMS = 2000;
+  const TRIM_TO = 1500;
+
   function appendSessionLog(item: LogItem) {
-    tabStates[activeTab].sessionLog = [...tabStates[activeTab].sessionLog, item];
+    const arr = tabStates[activeTab].sessionLog;
+    if (arr.length >= MAX_LOG_ITEMS) {
+      tabStates[activeTab].sessionLog = [...arr.slice(arr.length - TRIM_TO), item];
+    } else {
+      tabStates[activeTab].sessionLog = [...arr, item];
+    }
   }
   function appendTaskLog(item: LogItem) {
-    tabStates[activeTab].taskLog = [...tabStates[activeTab].taskLog, item];
+    const arr = tabStates[activeTab].taskLog;
+    if (arr.length >= MAX_LOG_ITEMS) {
+      tabStates[activeTab].taskLog = [...arr.slice(arr.length - TRIM_TO), item];
+    } else {
+      tabStates[activeTab].taskLog = [...arr, item];
+    }
   }
 
   let evtSource: EventSource | null = null;
@@ -172,7 +185,7 @@
       });
       // Parse model list as soon as transcript contains JSON data (don't wait for done)
       if (activeTab === 'hfdiscover' && hfModels.length === 0 && (sub === 'text' || sub === 'tool_result')) {
-        parseModelsFromLog();
+        try { parseModelsFromLog(); } catch { /* ignore parse errors */ }
       }
       return;
     }
@@ -206,13 +219,33 @@
     }
   }
 
+  let sseRetryCount = 0;
+  const SSE_MAX_RETRIES = 3;
+  let sseCurrentTaskId = '';
+
   function subscribeStream(task_id: string) {
     if (evtSource) evtSource.close();
+    sseRetryCount = 0;
+    sseCurrentTaskId = task_id;
+    _connectSSE(task_id);
+  }
+
+  function _connectSSE(task_id: string) {
     evtSource = new EventSource(`${BACKEND}/api/stream/${task_id}`);
     evtSource.onmessage = handleEvent;
     evtSource.onerror = () => {
-      isRunning = false;
       if (evtSource) evtSource.close();
+      if (sseRetryCount < SSE_MAX_RETRIES && isRunning) {
+        sseRetryCount++;
+        const delay = Math.min(1000 * sseRetryCount, 5000);
+        appendSessionLog({ timestamp: ts(), type: 'status', message: `Connection lost, reconnecting (${sseRetryCount}/${SSE_MAX_RETRIES})...` });
+        setTimeout(() => {
+          if (isRunning && sseCurrentTaskId === task_id) _connectSSE(task_id);
+        }, delay);
+      } else {
+        isRunning = false;
+        appendSessionLog({ timestamp: ts(), type: 'error', message: 'Stream disconnected. Task may still be running on server.' });
+      }
     };
   }
 

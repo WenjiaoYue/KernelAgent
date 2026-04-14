@@ -324,120 +324,132 @@ async def _watch_and_tail_session(queue, task_id, session_dir: str, stop, contai
     when --agent main is used it continues the existing agent:main:main session.
     We snapshot sizes before the run, then detect whichever file grows/appears.
     """
-    # --- Step 1: snapshot all .jsonl files and their sizes ---
-    snap_cmd = (
-        f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' "
-        f"-exec stat -c '%n %s' {{}} + 2>/dev/null || true"
-    )
-    snap_proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", container, "bash", "-c", snap_cmd,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-    )
-    out, _ = await snap_proc.communicate()
-    before: dict[str, int] = {}
-    for ln in out.decode().splitlines():
-        parts = ln.rsplit(None, 1)
-        if len(parts) == 2:
-            before[parts[0]] = int(parts[1])
-
-    # --- Step 2: poll until a file appears or grows ---
-    target_file: str | None = None
-    start_offset: int = 0
-    deadline = time.time() + 60
-    while time.time() < deadline and not stop.is_set():
-        check_proc = await asyncio.create_subprocess_exec(
+    try:
+        # --- Step 1: snapshot all .jsonl files and their sizes ---
+        snap_cmd = (
+            f"find {shlex.quote(session_dir)} -maxdepth 1 -name '*.jsonl' "
+            f"-exec stat -c '%n %s' {{}} + 2>/dev/null || true"
+        )
+        snap_proc = await asyncio.create_subprocess_exec(
             "docker", "exec", container, "bash", "-c", snap_cmd,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         )
-        curr_out, _ = await check_proc.communicate()
-        best_new: str | None = None   # newly created file
-        best_grown: str | None = None  # existing file that grew
-        best_grown_offset: int = 0
-        for ln in curr_out.decode().splitlines():
+        out, _ = await snap_proc.communicate()
+        before: dict[str, int] = {}
+        for ln in out.decode().splitlines():
             parts = ln.rsplit(None, 1)
-            if len(parts) != 2:
-                continue
-            fname, sz = parts[0], int(parts[1])
-            prev = before.get(fname, -1)
-            if sz > 0:
-                if prev == -1:          # brand-new file
-                    best_new = fname
-                    break
-                elif sz > prev:         # existing file grew
-                    if best_grown is None:
-                        best_grown = fname
-                        best_grown_offset = prev
-        if best_new is not None:
-            target_file = best_new
-            start_offset = 0
-            break
-        if best_grown is not None:
-            target_file = best_grown
-            start_offset = best_grown_offset
-            break
-        await asyncio.sleep(0.5)
+            if len(parts) == 2:
+                before[parts[0]] = int(parts[1])
 
-    if not target_file or stop.is_set():
-        return
-
-    # --- Step 3: tail from start_offset ---
-    # tail -c +N reads from byte N (1-indexed); +1 = from beginning, +(size+1) = after existing content
-    tail_cmd = f"tail -c +{start_offset + 1} -f {shlex.quote(target_file)}"
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", container, "bash", "-c", tail_cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    buf = ""
-    try:
-        async for raw in proc.stdout:
-            if stop.is_set():
-                break
-            buf += raw.decode(errors="replace")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line:
+        # --- Step 2: poll until a file appears or grows ---
+        target_file: str | None = None
+        start_offset: int = 0
+        deadline = time.time() + 60
+        while time.time() < deadline and not stop.is_set():
+            check_proc = await asyncio.create_subprocess_exec(
+                "docker", "exec", container, "bash", "-c", snap_cmd,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+            )
+            curr_out, _ = await check_proc.communicate()
+            best_new: str | None = None   # newly created file
+            best_grown: str | None = None  # existing file that grew
+            best_grown_offset: int = 0
+            for ln in curr_out.decode().splitlines():
+                parts = ln.rsplit(None, 1)
+                if len(parts) != 2:
                     continue
-                for sub_type, text in _parse_session_line(line):
-                    await queue.put(_evt(task_id, "transcript", text,
-                                        meta={"sub_type": sub_type}))
-    finally:
+                fname, sz = parts[0], int(parts[1])
+                prev = before.get(fname, -1)
+                if sz > 0:
+                    if prev == -1:          # brand-new file
+                        best_new = fname
+                        break
+                    elif sz > prev:         # existing file grew
+                        if best_grown is None:
+                            best_grown = fname
+                            best_grown_offset = prev
+            if best_new is not None:
+                target_file = best_new
+                start_offset = 0
+                break
+            if best_grown is not None:
+                target_file = best_grown
+                start_offset = best_grown_offset
+                break
+            await asyncio.sleep(0.5)
+
+        if not target_file or stop.is_set():
+            return
+
+        # --- Step 3: tail from start_offset ---
+        # tail -c +N reads from byte N (1-indexed); +1 = from beginning, +(size+1) = after existing content
+        tail_cmd = f"tail -c +{start_offset + 1} -f {shlex.quote(target_file)}"
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container, "bash", "-c", tail_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=1024 * 1024,  # 1 MB line limit (default 64 KB too small for session JSONL)
+        )
+        buf = ""
         try:
-            proc.kill()
-        except Exception:
-            pass
+            async for raw in proc.stdout:
+                if stop.is_set():
+                    break
+                buf += raw.decode(errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    for sub_type, text in _parse_session_line(line):
+                        await queue.put(_evt(task_id, "transcript", text,
+                                            meta={"sub_type": sub_type}))
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("_watch_and_tail_session error (non-fatal): %s", e)
 
 
 async def _tail_session_jsonl(queue, task_id, session_file, stop, container: str = DOCKER_CONTAINER):
     """Legacy: tail a known session file path. Use _watch_and_tail_session when file name is unknown."""
-    if not await _wait_file_in_docker(session_file, stop, container=container):
-        return
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", container,
-        "tail", "-n", "0", "-f", session_file,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    buf = ""
     try:
-        async for raw in proc.stdout:
-            if stop.is_set():
-                break
-            buf += raw.decode(errors="replace")
-            while "\n" in buf:
-                line, buf = buf.split("\n", 1)
-                line = line.strip()
-                if not line:
-                    continue
-                for sub_type, text in _parse_session_line(line):
-                    await queue.put(_evt(task_id, "transcript", text,
-                                        meta={"sub_type": sub_type}))
-    finally:
+        if not await _wait_file_in_docker(session_file, stop, container=container):
+            return
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", container,
+            "tail", "-n", "0", "-f", session_file,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=1024 * 1024,  # 1 MB line limit (default 64 KB too small for session JSONL)
+        )
+        buf = ""
         try:
-            proc.kill()
-        except Exception:
-            pass
+            async for raw in proc.stdout:
+                if stop.is_set():
+                    break
+                buf += raw.decode(errors="replace")
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.strip()
+                    if not line:
+                        continue
+                    for sub_type, text in _parse_session_line(line):
+                        await queue.put(_evt(task_id, "transcript", text,
+                                            meta={"sub_type": sub_type}))
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning("_tail_session_jsonl error (non-fatal): %s", e)
 
 
 async def run_zimage_task(task_id: str, req: ZImageRequest):
@@ -502,7 +514,7 @@ async def run_zimage_task(task_id: str, req: ZImageRequest):
             t.cancel()
             try:
                 await t
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
         if rc == 0:
@@ -606,7 +618,7 @@ async def run_autotest_task(task_id: str, req: "AutoTestRequest"):
         session_task.cancel()
         try:
             await session_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
         if rc == 0:
@@ -701,7 +713,7 @@ async def run_autoquant_task(task_id: str, req: "AutoQuantRequest"):
         session_task.cancel()
         try:
             await session_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
         if rc == 0:
@@ -790,7 +802,7 @@ async def run_autoeval_task(task_id: str, req: "AutoEvalRequest"):
         session_task.cancel()
         try:
             await session_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
         if rc == 0:
@@ -855,7 +867,7 @@ async def _run_agent_stage(
     session_task.cancel()
     try:
         await session_task
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, Exception):
         pass
 
     return rc == 0
@@ -1065,7 +1077,7 @@ async def run_excel_xlx_task(task_id: str, req: ExcelXLXRequest):
         session_task.cancel()
         try:
             await session_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
         if rc == 0:
@@ -1435,7 +1447,7 @@ async def run_hf_discover_task(task_id: str, req: HFDiscoverRequest):
         session_task.cancel()
         try:
             await session_task
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             pass
 
         if rc == 0:

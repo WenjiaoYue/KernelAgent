@@ -1,6 +1,6 @@
 ---
 name: auto_zimage
-description: Run Z-Image (Tongyi-MAI/Z-Image-Turbo) text-to-image on XPU/CUDA. Uses system Python environment directly, no venv or pip install needed.
+description: Run Z-Image (Tongyi-MAI/Z-Image-Turbo) text-to-image on XPU/CUDA. Handles venv, deps, error recovery.
 metadata:
   openclaw:
     emoji: "🎨"
@@ -14,8 +14,8 @@ metadata:
 
 # Auto Z-Image Inference Skill
 
-Use this skill to run Z-Image text-to-image generation using the system Python environment.
-No venv creation or pip install required — all dependencies are pre-installed.
+Use this skill to run Z-Image text-to-image generation.
+Handles venv creation, dependency installation, error recovery, and image saving.
 
 ---
 
@@ -25,14 +25,16 @@ No venv creation or pip install required — all dependencies are pre-installed.
 |-----------|-------------|----------|---------|
 | `prompt` | Text prompt for image generation | Yes | - |
 | `output_path` | Where to save the PNG | Yes | - |
-| `output_dir` | Parent dir for script + logs | Yes | - |
+| `output_dir` | Parent dir for venv + logs | Yes | - |
 | `device` | `xpu`, `xpu:0`, `cuda`, `cuda:0` | No | `xpu:0` |
 | `num_inference_steps` | Denoising steps | No | `9` |
 | `seed` | Random seed | No | `42` |
 
 ---
 
-## Step 1: Verify System Environment
+## Step 1: Check System Environment
+
+**CRITICAL: Always check existing torch BEFORE creating venv.**
 
 ```bash
 python3 -c "
@@ -44,16 +46,58 @@ try:
     print('XPU count:', torch.xpu.device_count())
 except AttributeError:
     print('XPU: not supported in this torch build')
-from diffusers import ZImagePipeline
-print('diffusers: OK, ZImagePipeline available')
-"
+" 2>/dev/null || echo "torch: NOT installed"
+
+pip3 list 2>/dev/null | grep -iE "diffusers|torch|triton|flash|intel"
 ```
 
-If any import fails, stop and report — do NOT attempt to install packages.
+**Decision table:**
+
+| System torch | Target device | Venv strategy |
+|---|---|---|
+| Installed, matches target | xpu or cuda | `--system-site-packages` (reuse torch) |
+| Installed CUDA, target is xpu | xpu | plain venv + install XPU torch |
+| NOT installed | any | plain venv + install matching torch |
 
 ---
 
-## Step 2: Write and Run Inference Script
+## Step 2: Create Isolated Virtual Environment
+
+```bash
+mkdir -p {output_dir}/logs
+
+# System torch matches target -> reuse it
+python3 -m venv {output_dir}/venv --system-site-packages
+# System torch absent or wrong backend -> plain venv (uncomment):
+# python3 -m venv {output_dir}/venv
+
+. {output_dir}/venv/bin/activate
+pip install -U pip setuptools wheel
+```
+
+**NEVER reinstall torch/flash_attn — driver-coupled.**
+
+---
+
+## Step 3: Install diffusers and Dependencies
+
+```bash
+. {output_dir}/venv/bin/activate
+pip install git+https://github.com/huggingface/diffusers transformers accelerate pillow
+
+# Verify
+python -c "import diffusers; print('diffusers:', diffusers.__version__)"
+python -c "import torch; print('torch:', torch.__version__)"
+```
+
+If XPU torch missing (system torch absent or wrong backend):
+```bash
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/xpu
+```
+
+---
+
+## Step 4: Write and Run Inference Script
 
 Save to `{output_dir}/zimage_run.py` with this content, then run it:
 
@@ -116,33 +160,36 @@ print(f"SUCCESS: {output_path}")
 
 Run:
 ```bash
-mkdir -p {output_dir}/logs
-python3 {output_dir}/zimage_run.py 2>&1 | tee {output_dir}/logs/zimage.log
+. {output_dir}/venv/bin/activate
+python {output_dir}/zimage_run.py 2>&1 | tee {output_dir}/logs/zimage.log
 ```
 
 ---
 
-## Step 3: Error Handling and Recovery
+## Step 5: Error Handling and Recovery
 
 | Error | Fix |
 |-------|-----|
-| `XPU not available` | Check driver: `xpu-smi` or `clinfo` |
+| `No module named 'diffusers'` | `pip install git+https://github.com/huggingface/diffusers` |
+| `No module named 'accelerate'` | `pip install accelerate` |
+| `XPU not available` | Check driver or install XPU torch |
 | `CUDA out of memory` | Use `torch_dtype=torch.float16` or free GPU |
 | `bfloat16 not supported` | Switch to `torch_dtype=torch.float16` |
 | `generator device mismatch` | Use `torch.Generator("xpu")` for XPU |
-| `AssertionError: XPU not available` | Wrong device, check `ZE_AFFINITY_MASK` |
+| `ZImagePipeline not found` | `pip install git+https://github.com/huggingface/diffusers` |
 
-**Always retry after fixing the script. Do NOT install packages.**
+**Always retry after fixing. Do not stop until the image is saved.**
 
 ```bash
 tail -50 {output_dir}/logs/zimage.log
 # fix script, then:
-python3 {output_dir}/zimage_run.py 2>&1 | tee -a {output_dir}/logs/zimage.log
+. {output_dir}/venv/bin/activate
+python {output_dir}/zimage_run.py 2>&1 | tee -a {output_dir}/logs/zimage.log
 ```
 
 ---
 
-## Step 4: Verify Output
+## Step 6: Verify Output
 
 ```bash
 ls -lh {output_path}
@@ -158,8 +205,11 @@ echo "Done: $(date)" >> {output_dir}/logs/zimage.log
 | XPU device select | `ZE_AFFINITY_MASK=0` before torch import |
 | CUDA device select | `CUDA_VISIBLE_DEVICES=0` before torch import |
 | Fix bfloat16 | `torch_dtype=torch.float16` |
+| Reuse system torch | `--system-site-packages` |
 | Generator device error | `torch.Generator("xpu")` or `torch.Generator("cuda")` |
 
-### NEVER DO
-- Create venv
-- pip install anything
+### NEVER MODIFY (driver-coupled)
+- torch, flash_attn, pytorch-triton
+
+### FREE TO INSTALL
+- diffusers, accelerate, pillow, transformers
