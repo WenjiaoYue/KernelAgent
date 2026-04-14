@@ -231,10 +231,23 @@
   }
 
   function _connectSSE(task_id: string) {
-    evtSource = new EventSource(`${BACKEND}/api/stream/${task_id}`);
-    evtSource.onmessage = handleEvent;
-    evtSource.onerror = () => {
-      if (evtSource) evtSource.close();
+    const es = new EventSource(`${BACKEND}/api/stream/${task_id}`);
+    evtSource = es;
+    let opened = false;
+    es.onopen = () => { opened = true; sseRetryCount = 0; };
+    es.onmessage = handleEvent;
+    es.onerror = () => {
+      es.close();
+      if (!opened) {
+        // Never connected (404 / task already gone) — don't retry
+        isRunning = false;
+        if (sseRetryCount > 0) {
+          // Was retrying after a previous disconnect — task finished while reconnecting
+          appendSessionLog({ timestamp: ts(), type: 'done', message: 'Task completed (stream ended).' });
+        }
+        return;
+      }
+      opened = false;
       if (sseRetryCount < SSE_MAX_RETRIES && isRunning) {
         sseRetryCount++;
         const delay = Math.min(1000 * sseRetryCount, 5000);
