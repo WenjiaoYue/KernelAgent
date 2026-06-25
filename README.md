@@ -1,3 +1,4 @@
+<img width="1390" height="817" alt="image" src="https://github.com/user-attachments/assets/03c0d195-34ef-4ddf-8cbd-80f7441997e6" />
 # KernelAgent — open-claw Control Demo
 
 A minimal full-stack demo: **SvelteKit** frontend + **FastAPI** backend with real-time SSE streaming.
